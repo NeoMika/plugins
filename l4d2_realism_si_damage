@@ -1,0 +1,283 @@
+#pragma semicolon 1
+#pragma newdecls required
+
+#include <sourcemod>
+#include <sdktools>
+#include <sdkhooks>
+#include <left4dhooks>
+
+#define PLUGIN_VERSION "4.0.0"
+
+// L4D2 伤害类型位（Valve dmgflags 与 CS:GO 同源；DMG_BUCKSHOT=1<<29 由 SDKHooks 提供）
+#define DMG_HEADSHOT    (1 << 30)
+
+// ========== 功能 1：写实模式特感减伤 ==========
+ConVar g_cvEnable;
+ConVar g_cvMult;
+ConVar g_cvHeadshotMult;   // 特感爆头伤害 = 武器基础伤害 × 此值（默认 1.0 = 官方小尸爆头算法）
+ConVar g_cvDebug;
+
+// ========== 功能 2：移除部分武器对小尸(common)的秒杀机制 ==========
+// 开关跟随总开关 l4d2_realism_si_enable；武器真实伤害不在此配置，
+// 由 sm_weapon 等改伤害插件管理，运行时用 left4dhooks 读取（L4D2IWA_Damage）
+
+ConVar g_cvGamemode;
+bool g_bHooked[MAXPLAYERS + 1];
+
+public Plugin myinfo =
+{
+	name = "L4D2 Realism SI Damage Reduction",
+	author = "L4D2 Agent->Neo、Mika",
+	description = "写实模式特感减伤(非爆头×0.25/爆头=基础伤害) + 移除沙鹰/榴弹对小尸秒杀",
+	version = PLUGIN_VERSION,
+	url = "https://steamcommunity.com/id/Mika0721/"
+};
+
+public void OnPluginStart()
+{
+	// 功能 1 cvar
+	g_cvEnable       = CreateConVar("l4d2_realism_si_enable", "0", "总开关：1=启用写实模式特感减伤", _, true, 0.0, true, 1.0);
+	g_cvMult         = CreateConVar("l4d2_realism_si_mult", "0.25", "特感非爆头伤害倍率（官方 common 同款 0.25）", _, true, 0.01, true, 1.0);
+	g_cvHeadshotMult = CreateConVar("l4d2_realism_si_headshot_mult", "1.0", "特感爆头伤害倍率（基于武器基础伤害；1.0=与官方小尸爆头算法一致）", _, true, 0.1, true, 10.0);
+	g_cvDebug        = CreateConVar("l4d2_realism_si_debug", "0", "调试日志：1=减伤/爆头/秒杀移除写入 addons/sourcemod/logs/");
+
+
+	//AutoExecConfig(true, "l4d2_realism_si_damage");
+
+	g_cvGamemode = FindConVar("mp_gamemode");
+	if (g_cvGamemode == null)
+		g_cvGamemode = FindConVar("sv_gamemode");
+
+	// 中途加载插件时，给已在场的玩家/特感补挂钩子
+	HookExistingClients();
+}
+
+void HookExistingClients()
+{
+	for (int i = 1; i <= MaxClients; i++)
+	{
+		if (IsClientInGame(i) && !g_bHooked[i])
+		{
+			g_bHooked[i] = true;
+			SDKHook(i, SDKHook_OnTakeDamage, OnTakeDamage);
+		}
+	}
+}
+
+public void OnMapStart()
+{
+	// 换图后重新挂钩（钩子标记随实体重建重置）
+	HookExistingClients();
+}
+
+public void OnClientPutInServer(int client)
+{
+	// 特感 bot / 幸存者进服都挂钩，回调里按队伍过滤
+	if (!g_bHooked[client])
+	{
+		g_bHooked[client] = true;
+		SDKHook(client, SDKHook_OnTakeDamage, OnTakeDamage);
+	}
+}
+
+public void OnClientDisconnect(int client)
+{
+	g_bHooked[client] = false;
+}
+
+// ========== 功能 1：特感减伤（每次伤害必调的可靠路径） ==========
+public Action OnTakeDamage(int victim, int &attacker, int &inflictor, float &damage, int &damagetype)
+{
+	if (!g_cvEnable.BoolValue)
+		return Plugin_Continue;
+
+	if (damage <= 0.0)
+		return Plugin_Continue;
+
+	写实模式（realism / realism_mutation4 等写实变体）
+	if (!IsRealismMode())
+		return Plugin_Continue;
+
+	// 受害者必须是特感（L4D2 队伍 3；Tank 也在内）
+	if (victim < 1 || victim > MaxClients || !IsClientInGame(victim) || GetClientTeam(victim) != 3)
+		return Plugin_Continue;
+
+	// 攻击者必须是幸存者（队伍 2）；attacker 丢失的纯火伤 tick 也减（与官方 common 行为一致）
+	bool bFromSurvivor = false;
+	if (attacker >= 1 && attacker <= MaxClients && IsClientInGame(attacker) && GetClientTeam(attacker) == 2)
+		bFromSurvivor = true;
+	if (!bFromSurvivor && !(damagetype & DMG_BURN))
+		return Plugin_Continue;
+
+	// 爆头：伤害 = 武器基础伤害 × headshot_mult（默认 1.0，与官方小尸爆头算法一致）
+	if (damagetype & DMG_HEADSHOT)
+	{
+		char cls[64];
+		if (GetWeaponClass(attacker, inflictor, cls, sizeof(cls)))
+		{
+			float fBase = GetWeaponBaseDamage(cls);
+			if (fBase > 0.0)
+			{
+				float fNew = fBase * g_cvHeadshotMult.FloatValue;
+				if (g_cvDebug.BoolValue)
+				{
+					LogMessage("[realism_si] 特感爆头 weapon=%s 原伤害=%.1f 基础=%.1f -> %.1f type=%d",
+					           cls, damage, fBase, fNew, damagetype);
+				}
+				damage = fNew;
+				return Plugin_Changed;
+			}
+		}
+		// 拿不到武器数据时保持原伤害
+		return Plugin_Continue;
+	}
+
+	// 近战对特感不减伤（近战保持原样伤害）
+	if (damagetype & (DMG_SLASH | DMG_CLUB))
+		return Plugin_Continue;
+
+	// 非爆头：× 倍率
+	float fNewDamage = damage * g_cvMult.FloatValue;
+	if (g_cvDebug.BoolValue)
+	{
+		LogMessage("[realism_si] 特感减伤 victim=%d atk=%d dmg=%.1f -> %.1f type=%d",
+		           victim, attacker, damage, fNewDamage, damagetype);
+	}
+
+	damage = fNewDamage;
+	return Plugin_Changed;
+}
+
+bool IsRealismMode()
+{
+	if (g_cvGamemode == null)
+		return false;
+	char sMode[32];
+	g_cvGamemode.GetString(sMode, sizeof(sMode));
+	return (strncmp(sMode, "realism", 7) == 0);
+}
+
+// ========== 功能 2：移除沙鹰/榴弹对小尸的秒杀 ==========
+public void OnEntityCreated(int entity, const char[] classname)
+{
+	// common infected：classname "infected" 且不是玩家/特感 client（entity > MaxClients）
+	if (entity > MaxClients && StrEqual(classname, "infected"))
+	{
+		SDKHook(entity, SDKHook_OnTakeDamage, OnCommonTakeDamage);
+	}
+}
+
+public Action OnCommonTakeDamage(int victim, int &attacker, int &inflictor, float &damage, int &damagetype)
+{
+	// 跟随总开关（l4d2_realism_si_enable）
+	if (!g_cvEnable.BoolValue)
+		return Plugin_Continue;
+
+	if (damage <= 0.0)
+		return Plugin_Continue;
+
+	// 攻击者必须是幸存者（队伍 2）
+	if (attacker < 1 || attacker > MaxClients || !IsClientInGame(attacker) || GetClientTeam(attacker) != 2)
+		return Plugin_Continue;
+
+	// ========== 近战/电锯对小尸减伤（写实模式）==========
+	// 近战伤害类型：刀类=DMG_SLASH、棒球棒/平底锅等钝器=DMG_CLUB、
+	// 电锯=DMG_SLASH；之前只认 SLASH 导致钝器漏掉（棒球棒仍一刀秒）。
+	if (damagetype & (DMG_SLASH | DMG_CLUB))
+	{
+		if (!IsRealismMode())
+			return Plugin_Continue;
+
+		// 用武器 classname 确认是近战或电锯
+		char clsMelee[64];
+		if (!GetWeaponClass(attacker, inflictor, clsMelee, sizeof(clsMelee))
+			|| (!StrEqual(clsMelee, "weapon_melee") && !StrEqual(clsMelee, "weapon_chainsaw")))
+			return Plugin_Continue;
+
+		// 近战爆头豁免：打头保持一刀必杀（与其他武器"爆头伤害不衰减"规则一致）
+		if (damagetype & DMG_HEADSHOT)
+			return Plugin_Continue;
+
+		// 每刀 = 小尸最大血量 × 0.25：所有小尸统一 4 刀死（含高血量小尸，
+		// 高血量小尸每刀伤害随血量放大，保证刀数一致）
+		int iMaxHP = GetEntProp(victim, Prop_Data, "m_iMaxHealth");
+		if (iMaxHP <= 0)
+			iMaxHP = 50;
+		float fNew = float(iMaxHP) * g_cvMult.FloatValue;
+		if (g_cvDebug.BoolValue)
+		{
+			LogMessage("[realism_si] common 近战减伤 dmg=%.1f -> %.1f (固定=血量×0.25)", damage, fNew);
+		}
+		damage = fNew;
+		return Plugin_Changed;
+	}
+	// ========== 近战减伤结束 ==========
+
+	// 只处理指定的武器
+	char cls[64];
+	if (!GetWeaponClass(attacker, inflictor, cls, sizeof(cls)))
+		return Plugin_Continue;
+	if (!IsFixWeaponName(cls))
+		return Plugin_Continue;
+
+	// 读取武器当前真实基础伤害（sm_weapon 等改伤害插件修改后的运行时值）
+	float fReal = GetWeaponBaseDamage(cls);
+	if (fReal <= 0.0)
+		return Plugin_Continue;
+
+	// 写实模式下，引擎对 common 的减伤（×0.25）已在 SDKHook 之前应用
+	// （插件看到的 dmg 是减后值，如沙鹰秒杀 200→50）。这里要把伤害重置为
+	// "真实伤害 × 写实倍率"，与其他武器结算一致（如 M16 打小尸 12.5）。
+	if (IsRealismMode())
+		fReal *= g_cvMult.FloatValue;
+
+	if (g_cvDebug.BoolValue)
+	{
+		LogMessage("[realism_si] common 秒杀移除 weapon=%s dmg=%.1f -> %.1f",
+		           cls, damage, fReal);
+	}
+
+	damage = fReal;
+	return Plugin_Changed;
+}
+
+bool IsFixWeaponName(const char[] cls)
+{
+	return (StrEqual(cls, "weapon_pistol_magnum"));
+}
+
+// 获取攻击者当前武器 classname（子弹的 inflictor 通常是武器实体；再兜底查主动武器）
+bool GetWeaponClass(int attacker, int inflictor, char[] cls, int maxlen)
+{
+	char buf[64];
+	if (inflictor > MaxClients && IsValidEntity(inflictor))
+	{
+		GetEdictClassname(inflictor, buf, sizeof(buf));
+		if (StrContains(buf, "weapon_") == 0)
+		{
+			strcopy(cls, maxlen, buf);
+			return true;
+		}
+	}
+
+	int weapon = GetEntPropEnt(attacker, Prop_Send, "m_hActiveWeapon");
+	if (weapon > MaxClients && IsValidEntity(weapon))
+	{
+		GetEdictClassname(weapon, buf, sizeof(buf));
+		if (StrContains(buf, "weapon_") == 0)
+		{
+			strcopy(cls, maxlen, buf);
+			return true;
+		}
+	}
+	return false;
+}
+
+// 读取武器当前真实基础伤害（sm_weapon 等修改后的运行时值）
+float GetWeaponBaseDamage(const char[] cls)
+{
+	if (GetFeatureStatus(FeatureType_Native, "L4D2_GetIntWeaponAttribute") != FeatureStatus_Available)
+		return 0.0;
+	int iDmg = L4D2_GetIntWeaponAttribute(cls, L4D2IWA_Damage);
+	return (iDmg > 0) ? float(iDmg) : 0.0;
+}
